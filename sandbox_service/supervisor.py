@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 from .config import SETTINGS, Settings
 from .models import ResolvedBudget
+from .queries import QueryControl
 from .wasi_instance import ExecutionOutcome, new_engine, run_module
 
 
@@ -38,6 +39,7 @@ class _Job:
     stdin: bytes
     budget: ResolvedBudget
     argv: list[str]
+    source_map: dict
 
 
 class ExecutionSupervisor:
@@ -66,6 +68,7 @@ class ExecutionSupervisor:
         stdin: bytes,
         budget: ResolvedBudget,
         argv: list[str],
+        source_map: dict | None = None,
     ) -> ExecutionOutcome:
         """Acquire a slot, run supervised, release once. Cancel-safe."""
         if not self._slots.acquire(blocking=False):
@@ -86,7 +89,7 @@ class ExecutionSupervisor:
         loop = asyncio.get_running_loop()
         cancel_event = threading.Event()
         finish_event = threading.Event()
-        job = _Job(module_bytes, stdin, budget, argv)
+        job = _Job(module_bytes, stdin, budget, argv, source_map or {})
 
         def cancel() -> None:
             cancel_event.set()
@@ -98,10 +101,11 @@ class ExecutionSupervisor:
             try:
                 engine = new_engine()
                 deadline = budget.timeout_ms / 1000.0
+                deadline_at = time.monotonic() + deadline
+                query_control = QueryControl()
 
                 def watchdog() -> None:
                     tick = self._settings.timer_tick_ms / 1000.0
-                    deadline_at = time.monotonic() + deadline
                     while True:
                         remaining = deadline_at - time.monotonic()
                         wait_for = min(tick, max(remaining, 0.0))
@@ -109,9 +113,11 @@ class ExecutionSupervisor:
                             return
                         if cancel_event.is_set():
                             engine._interrupt_reason = "execution cancelled"
+                            query_control.abort_all("execution cancelled by client disconnect or shutdown")
                             break
                         if remaining <= 0:
                             engine._interrupt_reason = "wall-clock timeout exceeded"
+                            query_control.abort_all("wall-clock timeout exceeded")
                             break
                     engine.increment_epoch()
                     # Some host-call windows can slip past one check; give a
@@ -128,7 +134,17 @@ class ExecutionSupervisor:
                     from .validation import compile_module
 
                     module = compile_module(engine, job.module_bytes)
-                    return run_module(engine, module, job.stdin, job.budget, job.argv)
+                    return run_module(
+                        engine,
+                        module,
+                        job.stdin,
+                        job.budget,
+                        job.argv,
+                        source_map=job.source_map,
+                        query_control=query_control,
+                        deadline_monotonic=deadline_at,
+                        query_grace_seconds=self._settings.query_close_grace_ms / 1000.0,
+                    )
                 finally:
                     finish_event.set()
                     watcher.join(timeout=self._settings.timer_tick_ms / 1000.0 + 0.1)

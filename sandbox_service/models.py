@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 from .config import Settings
 
 WASI_MODULE = "wasi_snapshot_preview1"
+SANDBOX_MODULE = "sandbox_queries"
+
+# Host-provided controlled data-source query ABI (v1).
+ALLOWED_SANDBOX_QUERY_IMPORTS = frozenset({"query_fetch", "query_read"})
 
 # Canonical WASI preview1 function set. Only imports from this module with
 # these exact function names are permitted.
@@ -74,6 +78,11 @@ class Budget(BaseModel):
     memory_bytes: Optional[int] = Field(default=None, ge=1, alias="memory_bytes")
     output_bytes: Optional[int] = Field(default=None, ge=0)
 
+    # Controlled data-source query limits; all optional and only tightenable.
+    query_count: Optional[int] = Field(default=None, ge=0)
+    query_response_bytes: Optional[int] = Field(default=None, ge=1)
+    query_total_bytes: Optional[int] = Field(default=None, ge=0)
+
     model_config = {"populate_by_name": True}
 
 
@@ -84,6 +93,9 @@ class ExecuteRequest(BaseModel):
     stdin: str = Field(default="")
     budget: Budget = Field(default_factory=Budget)
     argv: list[str] = Field(default_factory=list, max_length=64)
+    # Server-side source ids this execution may query. The guest never supplies
+    # URLs or credentials; an unknown/unauthorized id is rejected before run.
+    sources: list[str] = Field(default_factory=list, max_length=16)
 
 
 class RequestError(ValueError):
@@ -95,6 +107,9 @@ class ResolvedBudget(BaseModel):
     timeout_ms: int
     memory_bytes: int
     output_bytes: int
+    query_count: int
+    query_response_bytes: int
+    query_total_bytes: int
 
 
 def _b64decode(field_name: str, value: str, max_bytes: int) -> bytes:
@@ -109,7 +124,9 @@ def _b64decode(field_name: str, value: str, max_bytes: int) -> bytes:
     return raw
 
 
-def resolve_request(req: ExecuteRequest, settings: Settings) -> tuple[bytes, bytes, ResolvedBudget, list[str]]:
+def resolve_request(
+    req: ExecuteRequest, settings: Settings
+) -> tuple[bytes, bytes, ResolvedBudget, list[str], frozenset[str]]:
     module_bytes = _b64decode("module", req.module, settings.max_module_bytes)
     stdin_bytes = _b64decode("stdin", req.stdin, settings.max_stdin_bytes)
 
@@ -135,10 +152,49 @@ def resolve_request(req: ExecuteRequest, settings: Settings) -> tuple[bytes, byt
     if output_bytes > settings.max_output_bytes:
         raise RequestError(f"budget.output_bytes may not exceed {settings.max_output_bytes}")
 
+    query_count = (
+        budget.query_count if budget.query_count is not None else settings.default_query_count
+    )
+    if query_count > settings.max_query_count:
+        raise RequestError(f"budget.query_count may not exceed {settings.max_query_count}")
+
+    query_response_bytes = (
+        budget.query_response_bytes
+        if budget.query_response_bytes is not None
+        else settings.default_query_response_bytes
+    )
+    if query_response_bytes > settings.max_query_response_bytes:
+        raise RequestError(
+            f"budget.query_response_bytes may not exceed {settings.max_query_response_bytes}"
+        )
+
+    query_total_bytes = (
+        budget.query_total_bytes
+        if budget.query_total_bytes is not None
+        else settings.default_query_total_bytes
+    )
+    if query_total_bytes > settings.max_query_total_bytes:
+        raise RequestError(
+            f"budget.query_total_bytes may not exceed {settings.max_query_total_bytes}"
+        )
+
+    # Authorize requested sources against the server-side configuration. No
+    # source id means default-off networking; an unknown id is an input error
+    # and must never trigger any request.
+    configured = {source.source_id for source in settings.sources}
+    allowed: set[str] = set()
+    for source_id in req.sources:
+        if source_id not in configured:
+            raise RequestError(f"unknown or unconfigured data source: {source_id}")
+        allowed.add(source_id)
+
     argv = ["program", *req.argv]
     return module_bytes, stdin_bytes, ResolvedBudget(
         fuel=fuel,
         timeout_ms=timeout_ms,
         memory_bytes=memory_bytes,
         output_bytes=output_bytes,
-    ), argv
+        query_count=query_count,
+        query_response_bytes=query_response_bytes,
+        query_total_bytes=query_total_bytes,
+    ), argv, frozenset(allowed)

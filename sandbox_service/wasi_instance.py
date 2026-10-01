@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import struct
 import threading
+import time
 from dataclasses import dataclass
 
 from wasmtime import (
@@ -22,7 +24,17 @@ from wasmtime import (
 )
 from wasmtime import _func as _wasmtime_func
 
-from .models import ResolvedBudget
+from .models import SANDBOX_MODULE, ResolvedBudget
+from .queries import (
+    STATUS_BAD_ARG,
+    STATUS_BUFFER_TOO_SMALL,
+    STATUS_OK,
+    STATUS_READ_FAULT,
+    QueryAborted,
+    QueryBroker,
+    QueryControl,
+    QueryLimits,
+)
 from .streams import OutputLimit, StreamCapture
 
 _ERRNO_SUCCESS = 0
@@ -99,6 +111,10 @@ def run_module(
     stdin_bytes: bytes,
     budget: ResolvedBudget,
     argv: list[str],
+    source_map: dict | None = None,
+    query_control: QueryControl | None = None,
+    deadline_monotonic: float | None = None,
+    query_grace_seconds: float = 0.25,
 ) -> ExecutionOutcome:
     """Instantiate a fresh isolated instance and run its `_start`.
 
@@ -131,6 +147,25 @@ def run_module(
     linker.allow_shadowing = True
     linker.define_wasi()
     _bind_stream_funcs(linker, store, capture, stdin_view, stdin_pos)
+
+    broker: QueryBroker | None = None
+    if source_map is not None and query_control is not None:
+        broker = QueryBroker(
+            sources=source_map,
+            limits=QueryLimits(
+                max_count=budget.query_count,
+                max_response_bytes=budget.query_response_bytes,
+                max_total_bytes=budget.query_total_bytes,
+            ),
+            control=query_control,
+            deadline_monotonic=(
+                deadline_monotonic
+                if deadline_monotonic is not None
+                else time.monotonic() + budget.timeout_ms / 1000.0
+            ),
+            grace_seconds=query_grace_seconds,
+        )
+    _bind_query_funcs(linker, store, broker)
 
     try:
         instance = linker.instantiate(store, module)
@@ -172,6 +207,10 @@ def run_module(
         else:
             status = "trapped"
             reason = str(exc)
+    except QueryAborted as exc:
+        status = "resource_exhausted"
+        exit_code = None
+        reason = str(exc)
 
     if status == "trapped" and capture.truncated:
         status = "resource_exhausted"
@@ -254,3 +293,121 @@ def _bind_stream_funcs(
 
     linker.define_func("wasi_snapshot_preview1", "fd_write", io_type, fd_write, access_caller=True)
     linker.define_func("wasi_snapshot_preview1", "fd_read", io_type, fd_read, access_caller=True)
+
+
+def _pack_result(status: int, value: int) -> int:
+    """Pack (u32 status, u32 value) into the low 64 bits of an i64."""
+    packed = ((status & 0xFFFFFFFF) << 32) | (value & 0xFFFFFFFF)
+    return struct.unpack("<q", struct.pack("<Q", packed))[0]
+
+
+def _bind_query_funcs(linker: Linker, store: Store, broker: QueryBroker | None) -> None:
+    """Bind the controlled data-source query ABI under `sandbox_queries`.
+
+    query_fetch(src_ptr, src_len, key_ptr, key_len, buf_ptr, buf_len) -> i64
+        packed (status, value): STATUS_OK  -> value = body length, complete
+        body was copied into the guest buffer;
+        STATUS_BUFFER_TOO_SMALL -> value = retrieval token for query_read;
+        other failures -> value = 0, no bytes copied.
+
+    query_read(token, offset, buf_ptr, buf_len) -> i64
+        STATUS_OK with value = bytes copied into the buffer; an offset past
+        the end copies zero bytes and releases the cache slot.
+    """
+    i32 = ValType.i32()
+    i64 = ValType.i64()
+    fetch_type = FuncType([i32] * 6, [i64])
+    read_type = FuncType([i32] * 4, [i64])
+
+    def get_memory(caller) -> Memory:
+        memory = caller.get("memory")
+        if not isinstance(memory, Memory):
+            raise WasmtimeError("guest has no exported linear memory named 'memory'")
+        return memory
+
+    def guest_bytes(memory: Memory, ptr: int, length: int) -> bytes | None:
+        # Guest pointers are unsigned 32-bit; wasmtime may hand us the wrapped
+        # (negative) Python value for values over 2 GiB.
+        if length < 0:
+            return None
+        ptr &= 0xFFFFFFFF
+        try:
+            if ptr + length > memory.data_len(store):
+                return None
+            data = bytes(memory.read(store, ptr, ptr + length))
+        except (WasmtimeError, IndexError, ValueError):
+            return None
+        if len(data) != length:
+            return None
+        return data
+
+    def guest_write(memory: Memory, ptr: int, data: bytes) -> bool:
+        try:
+            memory.write(store, bytearray(data), ptr & 0xFFFFFFFF)
+            return True
+        except (WasmtimeError, IndexError, ValueError):
+            return False
+
+    def query_fetch(
+        caller,
+        src_ptr: int,
+        src_len: int,
+        key_ptr: int,
+        key_len: int,
+        buf_ptr: int,
+        buf_len: int,
+    ) -> int:
+        if broker is None:
+            return _pack_result(STATUS_BAD_ARG, 0)
+        memory = get_memory(caller)
+        if src_len > 64 or key_len > 4096 or buf_len < 0:
+            return _pack_result(STATUS_BAD_ARG, 0)
+        raw_source = guest_bytes(memory, src_ptr, src_len)
+        raw_key = guest_bytes(memory, key_ptr, key_len)
+        if raw_source is None or raw_key is None:
+            return _pack_result(STATUS_READ_FAULT, 0)
+        if not raw_source:
+            return _pack_result(STATUS_BAD_ARG, 0)
+        # Validate the destination buffer range before any outbound request so
+        # an illegal pointer never triggers network traffic.
+        if buf_len and guest_bytes(memory, buf_ptr, buf_len) is None:
+            return _pack_result(STATUS_READ_FAULT, 0)
+        try:
+            source_id = raw_source.decode("utf-8")
+            key = raw_key.decode("utf-8")
+        except UnicodeDecodeError:
+            return _pack_result(STATUS_BAD_ARG, 0)
+
+        status, body = broker.fetch(source_id, key)
+        if status != STATUS_OK or body is None:
+            return _pack_result(status, 0)
+        if len(body) > buf_len:
+            token = broker.store(body)
+            return _pack_result(STATUS_BUFFER_TOO_SMALL, token)
+        if len(body) and not guest_write(memory, buf_ptr, body):
+            return _pack_result(STATUS_READ_FAULT, 0)
+        return _pack_result(STATUS_OK, len(body))
+
+    def query_read(caller, token: int, offset: int, buf_ptr: int, buf_len: int) -> int:
+        if broker is None or token < 0 or offset < 0 or buf_len < 0:
+            return _pack_result(STATUS_BAD_ARG, 0)
+        memory = get_memory(caller)
+        body = broker.cached(token)
+        if body is None:
+            return _pack_result(STATUS_BAD_ARG, 0)
+        if buf_len and guest_bytes(memory, buf_ptr, buf_len) is None:
+            return _pack_result(STATUS_READ_FAULT, 0)
+        remaining = body[offset:]
+        chunk = remaining[:buf_len]
+        if len(chunk) and not guest_write(memory, buf_ptr, chunk):
+            return _pack_result(STATUS_READ_FAULT, 0)
+        if offset + len(chunk) >= len(body):
+            broker.release(token)
+        return _pack_result(STATUS_OK, len(chunk))
+
+    linker.define_func(
+        SANDBOX_MODULE, "query_fetch", fetch_type, query_fetch, access_caller=True
+    )
+    linker.define_func(
+        SANDBOX_MODULE, "query_read", read_type, query_read, access_caller=True
+    )

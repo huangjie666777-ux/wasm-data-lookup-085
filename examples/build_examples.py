@@ -20,6 +20,8 @@ EXAMPLES = (
     "exits_nonzero",
     "stderr_msg",
     "traps",
+    "enrich_device",
+    "query_probe",
 )
 
 

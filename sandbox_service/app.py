@@ -61,6 +61,13 @@ async def limits() -> dict:
         "max_memory_bytes": SETTINGS.max_memory_bytes,
         "default_output_bytes": SETTINGS.default_output_bytes,
         "max_output_bytes": SETTINGS.max_output_bytes,
+        "default_query_count": SETTINGS.default_query_count,
+        "max_query_count": SETTINGS.max_query_count,
+        "default_query_response_bytes": SETTINGS.default_query_response_bytes,
+        "max_query_response_bytes": SETTINGS.max_query_response_bytes,
+        "default_query_total_bytes": SETTINGS.default_query_total_bytes,
+        "max_query_total_bytes": SETTINGS.max_query_total_bytes,
+        "available_sources": sorted(source.source_id for source in SETTINGS.sources),
         "max_module_bytes": SETTINGS.max_module_bytes,
         "max_stdin_bytes": SETTINGS.max_stdin_bytes,
         "max_concurrency": SETTINGS.max_concurrency,
@@ -96,9 +103,15 @@ async def execute(request: Request) -> JSONResponse:
         return _json_error(400, "malformed request body", exc.errors())
 
     try:
-        module_bytes, stdin_bytes, budget, argv = resolve_request(req, SETTINGS)
+        module_bytes, stdin_bytes, budget, argv, allowed_sources = resolve_request(req, SETTINGS)
     except RequestError as exc:
         return _json_error(400, str(exc))
+
+    source_map = {
+        source.source_id: source
+        for source in SETTINGS.sources
+        if source.source_id in allowed_sources
+    }
 
     # Static validation + compilation happens before taking a concurrency slot.
     # Compilation failures are input errors and never consume execution slots.
@@ -125,6 +138,7 @@ async def execute(request: Request) -> JSONResponse:
             stdin=stdin_bytes,
             budget=budget,
             argv=argv,
+            source_map=source_map,
         )
     except LoadShedded:
         # Lost a race for the last slot between the check above and acquisition.
