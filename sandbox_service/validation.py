@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from wasmtime import Engine, Module, WasmtimeError
 
-from .models import ALLOWED_WASI_IMPORTS, WASI_MODULE
+from .models import ALLOWED_WASI_IMPORTS, SANDBOX_FUNCS, SANDBOX_MODULE, WASI_MODULE
 
 
 class ModuleInvalid(Exception):
@@ -29,16 +29,31 @@ def compile_module(engine: Engine, wasm_bytes: bytes) -> Module:
         raise ModuleInvalid(f"invalid wasm module: {exc}") from exc
 
     for imp in module.imports:
-        if imp.module != WASI_MODULE:
-            raise ModuleInvalid(
-                f"import from non-permitted module "
-                f"'{imp.module}::{'?' if imp.name is None else imp.name}'"
-            )
-        if imp.name is None or imp.name not in ALLOWED_WASI_IMPORTS:
-            raise ModuleInvalid(f"non-permitted import '{imp.module}::{imp.name}'")
         extern_type = imp.type
         if type(extern_type).__name__ != "FuncType":
-            raise ModuleInvalid(f"import '{imp.module}::{imp.name}' must be a function")
+            raise ModuleInvalid(
+                f"import '{imp.module}::{imp.name}' must be a function"
+            )
+        if imp.module == WASI_MODULE:
+            if imp.name is None or imp.name not in ALLOWED_WASI_IMPORTS:
+                raise ModuleInvalid(f"non-permitted import '{imp.module}::{imp.name}'")
+            continue
+        if imp.module == SANDBOX_MODULE:
+            if imp.name is None or imp.name not in SANDBOX_FUNCS:
+                raise ModuleInvalid(f"non-permitted import '{imp.module}::{imp.name}'")
+            expected_params, expected_results = SANDBOX_FUNCS[imp.name]
+            if (
+                list(extern_type.params) != list(expected_params)
+                or list(extern_type.results) != list(expected_results)
+            ):
+                raise ModuleInvalid(
+                    f"import '{imp.module}::{imp.name}' has wrong signature"
+                )
+            continue
+        raise ModuleInvalid(
+            "import from non-permitted module "
+            f"'{imp.module}::{'?' if imp.name is None else imp.name}'"
+        )
 
     exports = {ex.name: ex for ex in module.exports}
     start = exports.get("_start")

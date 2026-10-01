@@ -64,6 +64,13 @@ async def limits() -> dict:
         "max_module_bytes": SETTINGS.max_module_bytes,
         "max_stdin_bytes": SETTINGS.max_stdin_bytes,
         "max_concurrency": SETTINGS.max_concurrency,
+        "default_max_queries": SETTINGS.default_max_queries,
+        "max_max_queries": SETTINGS.max_max_queries,
+        "default_query_response_bytes": SETTINGS.default_query_response_bytes,
+        "max_query_response_bytes": SETTINGS.max_query_response_bytes,
+        "default_query_total_bytes": SETTINGS.default_query_total_bytes,
+        "max_query_total_bytes": SETTINGS.max_query_total_bytes,
+        "sources": sorted(source.id for source in SETTINGS.sources),
     }
 
 
@@ -96,7 +103,7 @@ async def execute(request: Request) -> JSONResponse:
         return _json_error(400, "malformed request body", exc.errors())
 
     try:
-        module_bytes, stdin_bytes, budget, argv = resolve_request(req, SETTINGS)
+        module_bytes, stdin_bytes, budget, argv, capabilities = resolve_request(req, SETTINGS)
     except RequestError as exc:
         return _json_error(400, str(exc))
 
@@ -125,6 +132,7 @@ async def execute(request: Request) -> JSONResponse:
             stdin=stdin_bytes,
             budget=budget,
             argv=argv,
+            capabilities=capabilities,
         )
     except LoadShedded:
         # Lost a race for the last slot between the check above and acquisition.

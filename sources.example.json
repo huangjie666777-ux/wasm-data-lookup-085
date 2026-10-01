@@ -1,0 +1,7 @@
+{
+  "specs": {"url": "http://127.0.0.1:8090/spec"},
+  "vendor": {
+    "url": "https://vendor.example.invalid/api/v2/device-spec",
+    "headers": {"Authorization": "Bearer REPLACE_WITH_TOKEN"}
+  }
+}

@@ -10,3 +10,4 @@ dist/
 *.egg-info/
 .env
 *.log
+sources.json

@@ -8,9 +8,41 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from wasmtime import ValType
+
 from .config import Settings
+from .config import SourceConfig
 
 WASI_MODULE = "wasi_snapshot_preview1"
+SANDBOX_MODULE = "sandbox"
+
+# Result codes returned by the "sandbox" host calls. Distinct, stable codes let
+# the guest tell query failures apart from guest-side buffer shortage.
+QUERY_OK = 0
+QUERY_ERR_BAD_SOURCE = 1
+QUERY_ERR_BAD_KEY = 2
+QUERY_ERR_BAD_POINTER = 3
+QUERY_ERR_BAD_UTF8 = 4
+QUERY_ERR_FAILED = 5
+QUERY_ERR_TOO_MANY = 6
+QUERY_ERR_RESPONSE_TOO_LARGE = 7
+QUERY_ERR_BAD_CAPACITY = 8
+QUERY_ERR_CANCELLED = 9
+
+# Fixed import signatures; validated before instantiation so a guest cannot
+# trick the host into reading integers/pointers of a different width.
+SANDBOX_FUNCS = {
+    # (source_id_ptr, source_id_len, key_ptr, key_len, response_id_out)
+    "query_fetch": (
+        [ValType.i32(), ValType.i32(), ValType.i32(), ValType.i32(), ValType.i32()],
+        [ValType.i32()],
+    ),
+    # (response_id, dest_ptr, dest_len, copied_out)
+    "query_body": (
+        [ValType.i32(), ValType.i32(), ValType.i32(), ValType.i32()],
+        [ValType.i32()],
+    ),
+}
 
 # Canonical WASI preview1 function set. Only imports from this module with
 # these exact function names are permitted.
@@ -73,6 +105,10 @@ class Budget(BaseModel):
     timeout_ms: Optional[int] = Field(default=None, ge=1)
     memory_bytes: Optional[int] = Field(default=None, ge=1, alias="memory_bytes")
     output_bytes: Optional[int] = Field(default=None, ge=0)
+    # Controlled data-source query ceilings (only tighten server max values).
+    max_queries: Optional[int] = Field(default=None, ge=0)
+    query_response_bytes: Optional[int] = Field(default=None, ge=0)
+    query_total_bytes: Optional[int] = Field(default=None, ge=0)
 
     model_config = {"populate_by_name": True}
 
@@ -84,6 +120,9 @@ class ExecuteRequest(BaseModel):
     stdin: str = Field(default="")
     budget: Budget = Field(default_factory=Budget)
     argv: list[str] = Field(default_factory=list, max_length=64)
+    # Source ids the guest is allowed to query THIS execution. The guest never
+    # supplies addresses or credentials; only operator-configured names.
+    allowed_sources: list[str] = Field(default_factory=list, max_length=16)
 
 
 class RequestError(ValueError):
@@ -95,6 +134,16 @@ class ResolvedBudget(BaseModel):
     timeout_ms: int
     memory_bytes: int
     output_bytes: int
+    max_queries: int
+    query_response_bytes: int
+    query_total_bytes: int
+
+
+class ResolvedCapabilities:
+    """Per-execution network capability: only these source ids may be used."""
+
+    def __init__(self, allowed: dict[str, "SourceConfig"]) -> None:
+        self.allowed = allowed
 
 
 def _b64decode(field_name: str, value: str, max_bytes: int) -> bytes:
@@ -109,7 +158,9 @@ def _b64decode(field_name: str, value: str, max_bytes: int) -> bytes:
     return raw
 
 
-def resolve_request(req: ExecuteRequest, settings: Settings) -> tuple[bytes, bytes, ResolvedBudget, list[str]]:
+def resolve_request(
+    req: ExecuteRequest, settings: Settings
+) -> tuple[bytes, bytes, ResolvedBudget, list[str], ResolvedCapabilities]:
     module_bytes = _b64decode("module", req.module, settings.max_module_bytes)
     stdin_bytes = _b64decode("stdin", req.stdin, settings.max_stdin_bytes)
 
@@ -135,10 +186,46 @@ def resolve_request(req: ExecuteRequest, settings: Settings) -> tuple[bytes, byt
     if output_bytes > settings.max_output_bytes:
         raise RequestError(f"budget.output_bytes may not exceed {settings.max_output_bytes}")
 
+    max_queries = (
+        budget.max_queries if budget.max_queries is not None else settings.default_max_queries
+    )
+    if max_queries > settings.max_max_queries:
+        raise RequestError(f"budget.max_queries may not exceed {settings.max_max_queries}")
+
+    query_response_bytes = (
+        budget.query_response_bytes
+        if budget.query_response_bytes is not None
+        else settings.default_query_response_bytes
+    )
+    if query_response_bytes > settings.max_query_response_bytes:
+        raise RequestError(
+            f"budget.query_response_bytes may not exceed {settings.max_query_response_bytes}"
+        )
+
+    query_total_bytes = (
+        budget.query_total_bytes
+        if budget.query_total_bytes is not None
+        else settings.default_query_total_bytes
+    )
+    if query_total_bytes > settings.max_query_total_bytes:
+        raise RequestError(
+            f"budget.query_total_bytes may not exceed {settings.max_query_total_bytes}"
+        )
+    known = {source.id: source for source in settings.sources}
+    allowed_ids: list[str] = []
+    for source_id in req.allowed_sources:
+        if source_id not in known:
+            raise RequestError(f"unknown data source '{source_id}'")
+        if source_id not in allowed_ids:
+            allowed_ids.append(source_id)
+
     argv = ["program", *req.argv]
     return module_bytes, stdin_bytes, ResolvedBudget(
         fuel=fuel,
         timeout_ms=timeout_ms,
         memory_bytes=memory_bytes,
         output_bytes=output_bytes,
-    ), argv
+        max_queries=max_queries,
+        query_response_bytes=query_response_bytes,
+        query_total_bytes=query_total_bytes,
+    ), argv, ResolvedCapabilities({sid: known[sid] for sid in allowed_ids})

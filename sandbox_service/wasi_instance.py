@@ -23,7 +23,10 @@ from wasmtime import (
 from wasmtime import _func as _wasmtime_func
 
 from .models import ResolvedBudget
+from .models import ResolvedCapabilities, SANDBOX_MODULE
 from .streams import OutputLimit, StreamCapture
+from .control import ExecutionControl
+from .query import QueryAborted, QueryState
 
 _ERRNO_SUCCESS = 0
 _ERRNO_BADF = 8
@@ -99,6 +102,8 @@ def run_module(
     stdin_bytes: bytes,
     budget: ResolvedBudget,
     argv: list[str],
+    capabilities: ResolvedCapabilities | None = None,
+    control: ExecutionControl | None = None,
 ) -> ExecutionOutcome:
     """Instantiate a fresh isolated instance and run its `_start`.
 
@@ -131,6 +136,15 @@ def run_module(
     linker.allow_shadowing = True
     linker.define_wasi()
     _bind_stream_funcs(linker, store, capture, stdin_view, stdin_pos)
+    if capabilities is not None and control is not None:
+        query_state = QueryState(
+            allowed=capabilities.allowed,
+            max_queries=budget.max_queries,
+            max_response_bytes=budget.query_response_bytes,
+            max_total_bytes=budget.query_total_bytes,
+            control=control,
+        )
+        _bind_query_funcs(linker, store, query_state)
 
     try:
         instance = linker.instantiate(store, module)
@@ -151,6 +165,10 @@ def run_module(
     exit_code: int | None = 0
     try:
         start(store)
+    except QueryAborted:
+        status = "resource_exhausted"
+        exit_code = None
+        reason = control.reason or "execution cancelled"
     except ExitTrap as exc:
         status = "exited"
         exit_code = exc.code
@@ -161,7 +179,11 @@ def run_module(
             reason = "instruction fuel exhausted"
         elif exc.trap_code is TrapCode.INTERRUPT:
             status = "resource_exhausted"
-            reason = getattr(engine, "_interrupt_reason", "wall-clock timeout")
+            reason = (
+                control.reason
+                if control is not None and control.reason
+                else "wall-clock timeout"
+            )
         else:
             status = "trapped"
             reason = _trap_message(exc)
@@ -254,3 +276,39 @@ def _bind_stream_funcs(
 
     linker.define_func("wasi_snapshot_preview1", "fd_write", io_type, fd_write, access_caller=True)
     linker.define_func("wasi_snapshot_preview1", "fd_read", io_type, fd_read, access_caller=True)
+
+
+def _bind_query_funcs(linker: Linker, store: Store, queries: QueryState) -> None:
+    i32 = ValType.i32()
+
+    fetch_type = FuncType([i32, i32, i32, i32, i32], [i32])
+    body_type = FuncType([i32, i32, i32, i32], [i32])
+
+    def query_fetch(
+        caller,
+        src_ptr: int,
+        src_len: int,
+        key_ptr: int,
+        key_len: int,
+        id_out: int,
+    ) -> int:
+        memory = _caller_memory(caller)
+        return queries.fetch(
+            caller, memory, src_ptr, src_len, key_ptr, key_len, id_out
+        )
+
+    def query_body(
+        caller, response_id: int, dst_ptr: int, dst_len: int, copied_out: int
+    ) -> int:
+        memory = _caller_memory(caller)
+        return queries.body(caller, memory, response_id, dst_ptr, dst_len, copied_out)
+
+    linker.define_func(SANDBOX_MODULE, "query_fetch", fetch_type, query_fetch, access_caller=True)
+    linker.define_func(SANDBOX_MODULE, "query_body", body_type, query_body, access_caller=True)
+
+
+def _caller_memory(caller) -> Memory:
+    memory = caller.get("memory")
+    if not isinstance(memory, Memory):
+        raise WasmtimeError("guest has no exported linear memory named 'memory'")
+    return memory
